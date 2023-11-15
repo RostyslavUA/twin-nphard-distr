@@ -14,6 +14,7 @@ import numpy as np
 import scipy.sparse as sp
 from multiprocessing import Queue
 from copy import deepcopy
+import copy
 import networkx as nx
 from scipy.stats.stats import pearsonr
 
@@ -40,6 +41,26 @@ from spektral.transforms import LayerPreprocess
 from solver_base_tf2 import Solver
 tf.config.run_functions_eagerly(True)
 
+# Dummy/convenience function for debugging
+def heuristic(ind_vec, adj, nn, zs_nn, z_std, n_samples):
+    """Defined by Rostyslav for convenience (debugging). I hope it does not change the results. """
+    for i in range(n_samples):
+        wts = np.random.uniform(0, 1, size=(nn, 1))
+        # zs_i = zs_nn + np.random.normal(0, z_std, size=(nn, 1))
+        zs_i = zs_nn + np.random.uniform(-0.5*z_std, 0.5*z_std, size=(nn, 1))
+        # zs_i = zs_nn
+        if FLAGS.predict == 'mwis':
+            gcn_wts = np.multiply(zs_i.flatten(), wts.flatten())
+        else:
+            gcn_wts = zs_i.flatten()
+
+        # _, total_ref = local_greedy_search(adj, wts)
+        mwis, _ = local_greedy_search(adj, gcn_wts)
+        solu = list(mwis)
+        total_wt = np.sum(wts[solu, 0])
+        ind_vec[solu, 0] += wts[solu, 0]/float(n_samples)
+    return ind_vec
+
 
 class DQNAgent(Solver):
     def __init__(self, input_flags, memory_size=5000):
@@ -50,7 +71,7 @@ class DQNAgent(Solver):
         self.model = self._build_model()
         self.memory_crt = deque(maxlen=memory_size)
         self.mse = MeanSquaredError()
-        self.critic = self._build_critic(num_layer=5)
+        self.critic = self._build_critic(num_layer=1)
 
     def _build_model(self):
         # Neural Net for Actor Model
@@ -78,7 +99,7 @@ class DQNAgent(Solver):
         # Build model
         model = Model(inputs=[x_in, a_in], outputs=gc_l)
         if self.flags.learning_decay == 1.0:
-            self.optimizer = Adam(lr=self.learning_rate)
+            self.optimizer = Adam(learning_rate=self.learning_rate)
         else:
             lr_schedule = schedules.ExponentialDecay(
                 initial_learning_rate=self.learning_rate,
@@ -88,7 +109,7 @@ class DQNAgent(Solver):
         model.summary()
         return model
 
-    def _build_critic(self, num_layer=3, dropout=0.0):
+    def _build_critic(self, num_layer=3, dropout=0.0, verbose=True):
         # Neural Net for Critic Model
         x_in = Input(shape=(self.flags.diver_num+1,), dtype=tf.float64, name="x_in")
         a_in = Input((None, ), sparse=True, dtype=tf.float64, name="a_in")
@@ -107,20 +128,21 @@ class DQNAgent(Solver):
                 output_dim, K=self.num_supports, activation=act,
                 kernel_regularizer=l2(self.l2_reg),
                 use_bias=True,
-                dtype='float64'
+                dtype='float64',
             )([do_l, a_in])
 
         # Build model
         model = Model(inputs=[x_in, a_in], outputs=gc_l)
         if self.flags.learning_decay == 1.0:
-            self.opt_crt = Adam(lr=0.0001)
+            self.opt_crt = Adam(learning_rate=0.0001)
         else:
             lr_schedule = schedules.ExponentialDecay(
                 initial_learning_rate=0.0001,
                 decay_steps=200,
                 decay_rate=self.flags.learning_decay)
             self.opt_crt = Adam(learning_rate=lr_schedule)
-        model.summary()
+        if verbose:
+            model.summary()
         return model
 
     def load_critic(self, name):
@@ -169,6 +191,7 @@ class DQNAgent(Solver):
         a_in = tf.sparse.SparseTensor(coord, values, shape)
         x_in = tf.concat([x_in, z_out], axis=1)
         sch_pred = self.critic([x_in, a_in])
+
         return sch_pred
 
     def replay(self, batch_size):
@@ -194,7 +217,6 @@ class DQNAgent(Solver):
         for grad, loss, _ in minibatch:
             self.opt_crt.apply_gradients(zip(grad, self.critic.trainable_weights))
             losses.append(loss)
-
         self.memory_crt.clear()
         return np.nanmean(losses)
 
@@ -254,28 +276,12 @@ class DQNAgent(Solver):
         nn = zs_nn.shape[0]
 
         # GCN
-        with tf.GradientTape() as g:
+        with tf.GradientTape(persistent=True) as g:
             g.watch(self.critic.trainable_weights)
             sch_pred = self.predict_critic(zs_0, state)
-
             ind_vec = np.zeros_like(sch_pred.numpy())
             apu_avg = 0.0
-            for i in range(n_samples):
-                wts = np.random.uniform(0, 1, size=(nn, 1))
-                # zs_i = zs_nn + np.random.normal(0, z_std, size=(nn, 1))
-                zs_i = zs_nn + np.random.uniform(-0.5*z_std, 0.5*z_std, size=(nn, 1))
-                # zs_i = zs_nn
-                if FLAGS.predict == 'mwis':
-                    gcn_wts = np.multiply(zs_i.flatten(), wts.flatten())
-                else:
-                    gcn_wts = zs_i.flatten()
-
-                # _, total_ref = local_greedy_search(adj, wts)
-                mwis, _ = local_greedy_search(adj, gcn_wts)
-                solu = list(mwis)
-                total_wt = np.sum(wts[solu, 0])
-                ind_vec[solu, 0] += wts[solu, 0]/float(n_samples)
-
+            ind_vec = heuristic(ind_vec, adj, nn, zs_nn, z_std, n_samples)
             # reward = apu_avg
             ind_vec[:, 1] = 1.0 - ind_vec[:, 0]
             corr, pval = pearsonr(ind_vec[:, 0], sch_pred[:, 0].numpy())
@@ -288,6 +294,123 @@ class DQNAgent(Solver):
         return ind_vec, reward
 
 
+class DQNAgentDistr(DQNAgent):
+    def __init__(self, input_flags, num_critic, memory_size=5000):
+        super(DQNAgent, self).__init__(input_flags, memory_size)
+        self.flags = input_flags
+        self.num_supports = 1 + self.flags.max_degree
+        self.l2_reg = 5e-4
+        self.model = self._build_model()
+        self.memory_crt = deque(maxlen=memory_size)
+        self.mse = MeanSquaredError()
+        self.critic = [self._build_critic(num_layer=1, verbose=False) for _ in range(num_critic)]
+        self.create_opt_crts(length=len(self.critic))
+
+    def create_opt_crts(self, length):
+        """Make sure that every critic has its own optimizer"""
+        self.opt_crt = [copy.copy(self.opt_crt) for _ in range(length)]
+
+    def foo_train(self, adj_0, wts_0, train=False):
+        adj = adj_0.copy()
+        nn  = wts_0.shape[0]
+        wts_nn = np.reshape(wts_0, (nn, FLAGS.feature_size))
+        ones = np.ones_like(wts_nn)
+
+        # GCN
+        with tf.GradientTape() as g:
+            g.watch(self.model.trainable_weights)
+            state = self.makestate(adj, ones)
+            act_val, act = self.act(state, train)
+            act_val_norm = act_val
+            sch_pred = self.predict_critic(act_val_norm, state)
+
+            if train:
+                regularization_loss = tf.reduce_sum(self.model.losses)
+                obj_fn = -tf.reduce_mean(sch_pred[:, 0])
+                obj_fn = obj_fn + regularization_loss
+                gradients = g.gradient(obj_fn, self.model.trainable_weights)
+                self.memorize(gradients, [], [], obj_fn.numpy(), 0)
+        return state, act_val
+
+    def predict_train(self, adj_0, zs_0, state, n_samples=1, z_std=0.15):
+        """
+        GCN followed by LGS
+        wts_0: topology weighted utility
+        """
+        adj = adj_0.copy()
+        zs_nn = zs_0.numpy()
+        nn = zs_nn.shape[0]
+
+        # GCN
+        for i, cr in enumerate(self.critic):
+            with tf.GradientTape() as g:
+                sch_pred = self.predict_critic(zs_0, state)
+                if i == 0:  # Some sort of circular dependency, which I am trying to solve with this if statement.
+                    # General problem : we need sch_pred to get y_target.
+                    # But we have to update the gradient inside tf.GradientTape() context manager for each model. It
+                    # means that with this setup we cannot obtain sch_pred like in cetralized case, because, again, we have
+                    # to iterate over all models. But we cannot do it, since each model has to be updated in each
+                    # consecutive iteration
+                    ind_vec = np.zeros_like(sch_pred)
+                    apu_avg = 0.0
+                    ind_vec = heuristic(ind_vec, adj, nn, zs_nn, z_std, n_samples)
+                    ind_vec[:, 1] = 1.0 - ind_vec[:, 0]
+                    corr, pval = pearsonr(ind_vec[:, 0], sch_pred[:, 0].numpy())
+                    reward = corr
+                    y_target = tf.convert_to_tensor(ind_vec, dtype=tf.float64)
+                y = y_target[i]
+                sh = sch_pred[i]
+                g.watch(cr.trainable_weights)
+                regularization_loss = tf.reduce_sum(cr.losses)
+                loss_value = tf.sqrt(self.mse(y, sh)) + regularization_loss
+                gradients = g.gradient(loss_value, cr.trainable_weights)
+                self.memorize_crt(gradients, loss_value.numpy(), reward)
+        reward = np.mean(list(zip(*self.memory_crt))[-1])
+        # ind_vec is not used anywhere donwstream. Ignoring. TODO: delete
+        return ind_vec, reward
+
+    def predict_critic(self, z_out, state):
+        #n=3
+        x_in = tf.convert_to_tensor(state["features"], dtype=tf.float64)
+        #z_out = z_out[:n]
+        coord, values, shape = state["support"]
+        coord = np.zeros_like(coord)
+        shape = (1, 1)
+        #shape = (n, n)
+        #coord = np.array([[0, 1], [0, 2], [1, 2]])
+        sch_pred = []
+        for item in zip(self.critic, x_in, z_out, coord, values):
+            cr, x, z, co, v = item
+            a_in = tf.sparse.SparseTensor([co], [v], shape)
+            x = tf.concat([[x], [z]], axis=1)
+            s_p = cr([x, a_in])
+            sch_pred.append(s_p)
+        return tf.squeeze(tf.stack(sch_pred))
+
+    def predict_critic_sep(self, z_out, state, idx):
+        """Predict separately for each critic"""
+        x_in = tf.convert_to_tensor(state["features"], dtype=tf.float64)[idx]
+        coord, values, shape = state["support"]
+        coord = coord[idx]
+        values = values[idx]
+        coord = np.zeros_like(coord)
+        shape = (1, 1)
+        a_in = tf.sparse.SparseTensor([coord], [values], shape)
+        x_in = tf.concat([[x_in], [z_out]], axis=1)
+        sch_pred = cr([x_in, a_in])
+        return tf.Tensor(sch_pred)
+
+    def replay_crt(self, batch_size):
+        losses = []
+        for i, cr_mem in enumerate(self.memory_crt):
+            if len(cr_mem) < batch_size:
+                return float('NaN')
+            minibatch = random.sample([cr_mem], batch_size)  # Warning: Quick workaround. Will crash for batch_size > 1
+            for grad, loss, _ in minibatch:
+                self.opt_crt[i].apply_gradients(zip(grad, self.critic[i].trainable_weights))
+                losses.append(loss)
+        self.memory_crt.clear()
+        return np.nanmean(losses)
 # use gpu 0
 os.environ['CUDA_VISIBLE_DEVICES'] = str(0)
 

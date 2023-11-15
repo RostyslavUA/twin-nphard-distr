@@ -29,6 +29,8 @@ from gcn.utils import *
 from runtime_config import flags, FLAGS
 from heuristics_mwcds import *
 
+import pdb
+
 flags.DEFINE_string('gtype', 'er', 'training graph type: er, grp, ws, ba')
 flags.DEFINE_string('test_datapath', './data/ER_Graph_Uniform_NP20_test', 'test dataset')
 flags.DEFINE_integer('ntrain', 1, 'Number of units in hidden layer 1.')
